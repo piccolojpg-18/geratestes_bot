@@ -1,14 +1,37 @@
 const { Telegraf } = require('telegraf');
 
-// Token do bot
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '8602408215:AAEBMp1TABQfPth6e8D_TW6EoAJrQh4Wbcs');
+// Token do seu bot
+const bot = new Telegraf('8602408215:AAEBMp1TABQfPth6e8D_TW6EoAJrQh4Wbcs');
 
-// Armazena os cupons em memória
-let cuponsAtivos = [];
+// Lista padrão de cupons ativos (salva fixo para nao perder na memoria da Netlify)
+let cuponsAtivos = [
+  {
+    regraTexto: "R$30 OFF EM COMPRAS ACIMA DE R$299 TODAS AS LOJAS",
+    porcentagem: null,
+    valorFixo: 30,
+    limiteMaximo: null,
+    valorMinimo: 299,
+    apenasLojaOficial: false
+  },
+  {
+    regraTexto: "R$90 OFF EM COMPRAS ACIMA DE R$899 TODAS AS LOJAS",
+    porcentagem: null,
+    valorFixo: 90,
+    limiteMaximo: null,
+    valorMinimo: 899,
+    apenasLojaOficial: false
+  },
+  {
+    regraTexto: "20% OFF EM COMPRAS ACIMA DE R$0 COM LIMITE DE R$20 LOJAS OFICIAIS",
+    porcentagem: 0.20,
+    valorFixo: null,
+    limiteMaximo: 20,
+    valorMinimo: 0,
+    apenasLojaOficial: true
+  }
+];
 
-/**
- * Processa a mensagem de ativação (#ativar)
- */
+// Processa a mensagem #ativar caso queira atualizar dinamicamente
 function processarListaCupons(textoMensagem) {
   const textoLimpo = textoMensagem.replace(/#ativar/i, '').trim();
   const linhas = textoLimpo.split('\n');
@@ -19,20 +42,12 @@ function processarListaCupons(textoMensagem) {
     if (!linha) continue;
 
     const ehLojaOficial = /LOJAS? OFICIAIS|SHOPEE MALL/i.test(linha);
-
-    // Desconto em %
     const pctMatch = linha.match(/(\d+)%/);
     const pctDesconto = pctMatch ? parseFloat(pctMatch[1]) / 100 : null;
-
-    // Desconto fixo em R$
     const fixoMatch = linha.match(/R\$\s*(\d+)\s*OFF/i);
     const valorFixo = fixoMatch ? parseFloat(fixoMatch[1]) : null;
-
-    // Teto / Limite de desconto
     const tetoMatch = linha.match(/(?:LIMITE DE|ATE)\s*R\$\s*(\d+)/i);
     const limiteMaximo = tetoMatch ? parseFloat(tetoMatch[1]) : null;
-
-    // Valor mínimo
     const minMatch = linha.match(/ACIMA DE\s*R\$\s*(\d+)/i);
     const valorMinimo = minMatch ? parseFloat(minMatch[1]) : 0;
 
@@ -49,13 +64,9 @@ function processarListaCupons(textoMensagem) {
   return cupons;
 }
 
-/**
- * Calcula o melhor cupom para o produto
- */
+// Calcula o melhor cupom para um valor
 function calcularMelhorCupom(precoOriginal, isLojaOficial = false) {
-  if (!cuponsAtivos || cuponsAtivos.length === 0) {
-    return null;
-  }
+  if (!cuponsAtivos || cuponsAtivos.length === 0) return null;
 
   let melhorDesconto = 0;
   let melhorCupom = null;
@@ -92,15 +103,17 @@ function calcularMelhorCupom(precoOriginal, isLojaOficial = false) {
   return melhorCupom;
 }
 
-// ------------------------------------------------------------------
-// REGRAS DO TELEGRAM
-// ------------------------------------------------------------------
+// Resposta ao comando /start ou oi
+bot.start((ctx) => ctx.reply('🤖 Olá! O bot está ativo na Netlify! Envie /testar 100 oficial para testar um produto.'));
 
+// Handler para #ativar
 bot.hears(/#ativar/i, (ctx) => {
-  const textoMensagem = ctx.message.text;
-  cuponsAtivos = processarListaCupons(textoMensagem);
-
-  let resposta = `✅ *${cuponsAtivos.length} Cupons Ativados com Sucesso!*\n\n`;
+  const novosCupons = processarListaCupons(ctx.message.text);
+  if (novosCupons.length > 0) {
+    cuponsAtivos = novosCupons;
+  }
+  
+  let resposta = `✅ *${cuponsAtivos.length} Cupons Ativos no Bot!*\n\n`;
   cuponsAtivos.forEach((c, idx) => {
     resposta += `*${idx + 1}.* ${c.regraTexto}\n`;
   });
@@ -108,13 +121,14 @@ bot.hears(/#ativar/i, (ctx) => {
   return ctx.replyWithMarkdown(resposta);
 });
 
+// Handler para /testar
 bot.command('testar', (ctx) => {
   const args = ctx.message.text.split(' ');
   const preco = parseFloat(args[1]);
   const isOficial = args[2] && args[2].toLowerCase() === 'oficial';
 
   if (isNaN(preco)) {
-    return ctx.reply('⚠️ Use o comando informando o valor. Exemplo: `/testar 350 oficial`', { parse_mode: 'Markdown' });
+    return ctx.reply('⚠️ Use: `/testar 350 oficial` ou `/testar 100`', { parse_mode: 'Markdown' });
   }
 
   const resultado = calcularMelhorCupom(preco, isOficial);
@@ -132,19 +146,23 @@ bot.command('testar', (ctx) => {
   return ctx.replyWithMarkdown(msg);
 });
 
-// ------------------------------------------------------------------
-// ESTRUTURA HANDLER OBRIGATÓRIA DA NETLIFY (SERVERLESS)
-// ------------------------------------------------------------------
+// Responde a qualquer mensagem de texto comum para testar conexão
+bot.on('text', (ctx) => {
+  if (ctx.message.text.startsWith('/')) return;
+  return ctx.reply(`🤖 Recebi sua mensagem: "${ctx.message.text}". O bot está ligado! Use /testar 100 oficial para calcular cupons.`);
+});
+
+// ESTRUTURA SERVERLESS DA NETLIFY
 exports.handler = async (event) => {
   try {
     if (event.httpMethod === 'POST' && event.body) {
       const update = JSON.parse(event.body);
       await bot.handleUpdate(update);
-      return { statusCode: 200, body: 'OK' };
+      return { statusCode: 200, body: JSON.stringify({ ok: true }) };
     }
-    return { statusCode: 200, body: 'Bot de testes está rodando!' };
-  } catch (error) {
-    console.error('Erro no processamento:', error);
-    return { statusCode: 500, body: error.toString() };
+    return { statusCode: 200, body: 'Bot Netlify OK' };
+  } catch (err) {
+    console.error(err);
+    return { statusCode: 500, body: err.toString() };
   }
 };
