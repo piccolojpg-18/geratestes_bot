@@ -1,265 +1,168 @@
-const Jimp = require('jimp');
+const { Telegraf } = require('telegraf');
 
+// Inicialize seu bot com o TOKEN fornecido pelo @BotFather
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+
+// Variável para armazenar os cupons ativos em memória
 let cuponsAtivos = [];
 
-exports.handler = async (event) => {
-    const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || "8602408215:AAEBMp1TABQfPth6e8D_TW6EoAJrQh4Wbcs").trim();
+/**
+ * Função para extrair e interpretar a lista de cupons enviada no modelo:
+ * #ativar
+ * R$30 OFF EM COMPRAS ACIMA DE R$299 TODAS AS LOJAS
+ * R$90 OFF EM COMPRAS ACIMA DE R$899 TODAS AS LOJAS
+ * 20% OFF EM COMPRAS ACIMA DE R$0 COM LIMITE DE R$20 LOJAS OFICIAIS
+ */
+function processarListaCupons(textoMensagem) {
+  const textoLimpo = textoMensagem.replace(/#ativar/i, '').trim();
+  const linhas = textoLimpo.split('\n');
+  const cupons = [];
 
-    async function obterDadosShopee(url) {
-        try {
-            let urlFinal = url;
-            try {
-                const resRedir = await fetch(url, { method: 'HEAD', redirect: 'follow' });
-                if (resRedir.url) urlFinal = resRedir.url;
-            } catch (e) {
-                console.warn("⚠️ Não foi possível seguir o redirecionamento HEAD.");
-            }
+  for (let linha of linhas) {
+    linha = linha.trim();
+    if (!linha) continue;
 
-            const matchIds = urlFinal.match(/i\.(\d+)\.(\d+)/) || urlFinal.match(/\/(\d+)\/(\d+)/);
-            let shopid = null;
-            let itemid = null;
+    // Identifica se o cupom é exclusivo para Lojas Oficiais (Shopee Mall)
+    const ehLojaOficial = /LOJAS? OFICIAIS|SHOPEE MALL/i.test(linha);
 
-            if (matchIds) {
-                shopid = matchIds[1];
-                itemid = matchIds[2];
-            } else {
-                const urlObj = new URL(urlFinal);
-                shopid = urlObj.searchParams.get("shopid");
-                itemid = urlObj.searchParams.get("itemid");
-            }
+    // Extrai desconto em porcentagem (ex: 20%)
+    const pctMatch = linha.match(/(\d+)%/);
+    const pctDesconto = pctMatch ? parseFloat(pctMatch[1]) / 100 : null;
 
-            if (!shopid || !itemid) return null;
+    // Extrai desconto fixo em Reais (ex: R$30 ou R$ 30)
+    const fixoMatch = linha.match(/R\$\s*(\d+)\s*OFF/i);
+    const valorFixo = fixoMatch ? parseFloat(fixoMatch[1]) : null;
 
-            const apiUrl = `https://shopee.com.br/api/v4/item/get?itemid=${itemid}&shopid=${shopid}`;
-            const res = await fetch(apiUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-            });
-            
-            const data = await res.json();
-            if (data && data.data) {
-                const item = data.data;
-                return {
-                    titulo: item.title || item.name,
-                    precoExato: item.price ? item.price / 100000 : null,
-                    isOficial: !!(item.is_official_shop || item.shopee_verified)
-                };
-            }
-        } catch (err) {
-            console.error("❌ Erro ao consultar a API da Shopee:", err);
-        }
-        return null;
+    // Extrai limite máximo do desconto (ex: COM LIMITE DE R$20 ou ATE R$20)
+    const tetoMatch = linha.match(/(?:LIMITE DE|ATE)\s*R\$\s*(\d+)/i);
+    const limiteMaximo = tetoMatch ? parseFloat(tetoMatch[1]) : null;
+
+    // Extrai valor mínimo de compra (ex: ACIMA DE R$299)
+    const minMatch = linha.match(/ACIMA DE\s*R\$\s*(\d+)/i);
+    const valorMinimo = minMatch ? parseFloat(minMatch[1]) : 0;
+
+    cupons.push({
+      regraTexto: linha,
+      porcentagem: pctDesconto,
+      valorFixo: valorFixo,
+      limiteMaximo: limiteMaximo,
+      valorMinimo: valorMinimo,
+      apenasLojaOficial: ehLojaOficial
+    });
+  }
+
+  return cupons;
+}
+
+/**
+ * Função para calcular o melhor cupom aplicável a um determinado produto
+ * @param {number} precoOriginal - Preço atual do produto
+ * @param {boolean} isLojaOficial - Se o vendedor é Loja Oficial / Shopee Mall
+ */
+function calcularMelhorCupom(precoOriginal, isLojaOficial = false) {
+  if (!cuponsAtivos || cuponsAtivos.length === 0) {
+    return null;
+  }
+
+  let melhorDesconto = 0;
+  let melhorCupom = null;
+
+  for (const cupom of cuponsAtivos) {
+    // Valida se o produto atende ao requisito de Loja Oficial
+    if (cupom.apenasLojaOficial && !isLojaOficial) {
+      continue;
     }
 
-    async function baixarFotoTelegram(fileId) {
-        try {
-            const resFile = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
-            const dataFile = await resFile.json();
-            
-            if (dataFile.ok && dataFile.result && dataFile.result.file_path) {
-                const urlDownload = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${dataFile.result.file_path}`;
-                const resImg = await fetch(urlDownload);
-                const arrayBuffer = await resImg.arrayBuffer();
-                return Buffer.from(arrayBuffer);
-            }
-        } catch (err) {
-            console.error("❌ Erro ao baixar foto do Telegram:", err);
-        }
-        return null;
+    // Valida se o valor do produto atinge o mínimo exigido pelo cupom
+    if (precoOriginal < cupom.valorMinimo) {
+      continue;
     }
 
-    async function cortarImagemProduto(bufferOriginal) {
-        try {
-            const image = await Jimp.read(bufferOriginal);
-            const largura = image.getWidth();
-            const altura = image.getHeight();
+    let descontoCalculado = 0;
 
-            const inicioX = Math.floor(largura * 0.10);
-            const inicioY = Math.floor(altura * 0.10);
-
-            const novaLargura = largura - Math.floor(largura * 0.10) - Math.floor(largura * 0.10);
-            const novaAltura = altura - Math.floor(altura * 0.10) - Math.floor(altura * 0.32);
-
-            image.crop(inicioX, inicioY, novaLargura, novaAltura);
-
-            return await image.getBufferAsync(Jimp.MIME_JPEG);
-        } catch (err) {
-            console.error("❌ Erro no processamento do Jimp:", err);
-            return bufferOriginal;
-        }
+    // Cálculo se for Cupom de Porcentagem
+    if (cupom.porcentagem) {
+      descontoCalculado = precoOriginal * cupom.porcentagem;
+      // Aplica o teto/limite de desconto, se houver
+      if (cupom.limiteMaximo && descontoCalculado > cupom.limiteMaximo) {
+        descontoCalculado = cupom.limiteMaximo;
+      }
+    } 
+    // Cálculo se for Cupom de Valor Fixo
+    else if (cupom.valorFixo) {
+      descontoCalculado = cupom.valorFixo;
     }
 
-    async function enviarFotoTelegram(chatId, bufferFoto, legenda) {
-        try {
-            const { default: fetch } = await import('node-fetch');
-            const FormData = (await import('form-data')).default;
-
-            const form = new FormData();
-            form.append('chat_id', chatId);
-            form.append('photo', bufferFoto, { filename: 'oferta.jpg', contentType: 'image/jpeg' });
-            form.append('caption', legenda);
-            form.append('parse_mode', 'Markdown');
-
-            await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`, {
-                method: 'POST',
-                body: form
-            });
-        } catch (err) {
-            console.error(`❌ Erro foto Telegram (${chatId}):`, err);
-        }
+    // Garante que o desconto não seja maior que o preço total do produto
+    if (descontoCalculado > precoOriginal) {
+      descontoCalculado = precoOriginal;
     }
 
-    async function enviarTextoTelegram(chatId, texto) {
-        try {
-            await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, text: texto, parse_mode: 'Markdown' })
-            });
-        } catch (err) {
-            console.error(`❌ Erro texto Telegram (${chatId}):`, err);
-        }
+    // Compara para guardar sempre o cupom que concede O MAIOR desconto em R$
+    if (descontoCalculado > melhorDesconto) {
+      melhorDesconto = descontoCalculado;
+      melhorCupom = {
+        ...cupom,
+        valorDesconto: descontoCalculado,
+        precoFinal: precoOriginal - descontoCalculado
+      };
     }
+  }
 
-    if (event.httpMethod === "POST") {
-        let body = {};
-        try {
-            body = JSON.parse(event.body || "{}");
-        } catch (e) {
-            return { statusCode: 400, body: "JSON Inválido" };
-        }
+  return melhorCupom;
+}
 
-        const message = body.message || body;
-        if (!message) return { statusCode: 200, body: "Sem mensagem" };
+// ------------------------------------------------------------------
+// HANDLERS DO TELEGRAM BOT
+// ------------------------------------------------------------------
 
-        const textoOriginal = message.text || message.caption || "";
-        const chatOrigemId = message.chat ? String(message.chat.id) : null;
+// Handler para registrar e ativar a lista de cupons via #ativar
+bot.hears(/#ativar/i, (ctx) => {
+  const textoMensagem = ctx.message.text;
+  cuponsAtivos = processarListaCupons(textoMensagem);
 
-        if (!chatOrigemId) return { statusCode: 200, body: "Sem chat de origem" };
+  let resposta = `✅ *${cuponsAtivos.length} Cupons Ativados com Sucesso!*\n\n`;
+  cuponsAtivos.forEach((c, idx) => {
+    resposta += `*${idx + 1}.* ${c.regraTexto}\n`;
+  });
 
-        let fileIdFoto = null;
-        if (message.photo && message.photo.length > 0) {
-            fileIdFoto = message.photo[message.photo.length - 1].file_id;
-        }
+  return ctx.replyWithMarkdown(resposta);
+});
 
-        if (/#ativar/i.test(textoOriginal)) {
-            cuponsAtivos = [];
-            const linhas = textoOriginal.split('\n');
-            for (let linha of linhas) {
-                const matchFixo = linha.match(/R\$\s*([\d.,]+)\s*OFF.*ACIMA DE\s*R\$\s*([\d.,]+)/i);
-                const matchPorcentagem = linha.match(/([\d.,]+)%\s*OFF(?:.*LIMITE DE\s*R\$\s*([\d.,]+))?/i);
+// Exemplo de Handler para testar um preço manualmente
+// Envie no chat: /testar 350 oficial (ou /testar 350)
+bot.command('testar', (ctx) => {
+  const args = ctx.message.text.split(' ');
+  const preco = parseFloat(args[1]);
+  const isOficial = args[2] && args[2].toLowerCase() === 'oficial';
 
-                if (matchFixo) {
-                    cuponsAtivos.push({
-                        tipo: 'FIXO',
-                        desconto: parseFloat(matchFixo[1].replace(',', '.')),
-                        minimo: parseFloat(matchFixo[2].replace(',', '.')),
-                        textoCupom: `R$${matchFixo[1]} OFF`
-                    });
-                } else if (matchPorcentagem) {
-                    cuponsAtivos.push({
-                        tipo: 'PORCENTAGEM',
-                        pct: parseFloat(matchPorcentagem[1].replace(',', '.')),
-                        limite: matchPorcentagem[2] ? parseFloat(matchPorcentagem[2].replace(',', '.')) : Infinity,
-                        textoCupom: `ATIVE ${matchPorcentagem[1]}% OFF`
-                    });
-                }
-            }
+  if (isNaN(preco)) {
+    return ctx.reply('⚠️ Por favor, informe um valor válido. Exemplo: `/testar 350 oficial`', { parse_mode: 'Markdown' });
+  }
 
-            await enviarTextoTelegram(chatOrigemId, `🚀 *[MODO TESTE]* Cupons ativados com sucesso! Total: ${cuponsAtivos.length}`);
-            return { statusCode: 200, body: "Cupons Ativados" };
-        }
+  const resultado = calcularMelhorCupom(preco, isOficial);
 
-        const links = textoOriginal.match(/https?:\/\/[^\s]+/g) || [];
-        const matchPor = textoOriginal.match(/por\s*R\$\s*([\d.]+,\d{2})/i);
+  if (!resultado) {
+    return ctx.reply(`❌ Nenhum cupom aplicável para R$ ${preco.toFixed(2)} ${isOficial ? '(Loja Oficial)' : ''}.`);
+  }
 
-        let valorBase = null;
-        let titulo = textoOriginal.split('\n')[0].trim();
-        let eLojaOficial = false;
+  const msg = `🏷️ *Melhor Cupom Encontrado!*\n\n` +
+              `💰 *Preço Original:* R$ ${preco.toFixed(2)}\n` +
+              `🔻 *Desconto:* R$ ${resultado.valorDesconto.toFixed(2)}\n` +
+              `🔥 *Preço Final:* R$ ${resultado.precoFinal.toFixed(2)}\n` +
+              `📌 *Regra Aplicada:* ${resultado.regraTexto}`;
 
-        if (links[0]) {
-            await enviarTextoTelegram(chatOrigemId, "🔍 *[TESTE]* Consultando produto na Shopee...");
-            const dadosShopee = await obterDadosShopee(links[0]);
-            
-            if (dadosShopee && dadosShopee.precoExato) {
-                valorBase = dadosShopee.precoExato;
-                if (dadosShopee.titulo) titulo = dadosShopee.titulo;
-                eLojaOficial = dadosShopee.isOficial;
-            }
-        }
+  return ctx.replyWithMarkdown(msg);
+});
 
-        if (!valorBase && matchPor) {
-            valorBase = parseFloat(matchPor[1].replace(/\./g, '').replace(',', '.'));
-        }
-
-        if (valorBase) {
-            let maiorDescontoBRL = 0;
-            let cupomNome = "";
-
-            if (cuponsAtivos.length > 0) {
-                for (let cupom of cuponsAtivos) {
-                    let descontoTeste = 0;
-                    if (cupom.tipo === 'PORCENTAGEM') {
-                        descontoTeste = valorBase * (cupom.pct / 100);
-                        if (descontoTeste > cupom.limite) descontoTeste = cupom.limite;
-                    } else if (cupom.tipo === 'FIXO') {
-                        if (valorBase >= cupom.minimo) descontoTeste = cupom.desconto;
-                    }
-
-                    if (descontoTeste > maiorDescontoBRL) {
-                        maiorDescontoBRL = descontoTeste;
-                        cupomNome = cupom.textoCupom;
-                    }
-                }
-            }
-
-            let valorPorFinal = valorBase - maiorDescontoBRL;
-            let pctSorteada = Math.floor(Math.random() * (79 - 30 + 1)) + 30;
-            let valorDeFicticio = valorPorFinal * (1 + (pctSorteada / 100));
-            let pctExibida = Math.round(((valorDeFicticio - valorPorFinal) / valorDeFicticio) * 100);
-
-            const formatar = (v) => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-
-            let seloOficial = eLojaOficial ? " 🏆 *(LOJA OFICIAL)*" : "";
-            let resposta = `${titulo}${seloOficial}\n\n`;
-            resposta += `💸💸 ~~de ${formatar(valorDeFicticio)}~~\n`;
-            resposta += `por ${formatar(valorPorFinal)} 🔥\n`;
-            resposta += `✨ ${pctExibida}% de desconto! 🔥\n\n`;
-
-            if (cupomNome) resposta += `🎟️Use o cupom: ${cupomNome}\n\n`;
-            if (links[0]) resposta += `Compre aqui: ${links[0]}\n\n`;
-
-            const temDesativar = /#desativar/i.test(textoOriginal);
-            if (!temDesativar) {
-                if (links[1]) {
-                    resposta += `🚨 Ative os cupons do dia aqui: ${links[1]}`;
-                } else {
-                    resposta += `🚨 Ative os cupons do dia aqui: https://s.shopee.com.br/z2ECVAKV`;
-                }
-            }
-
-            resposta = resposta.trim();
-
-            let bufferCortado = null;
-            if (fileIdFoto) {
-                const bufferOriginal = await baixarFotoTelegram(fileIdFoto);
-                if (bufferOriginal) {
-                    bufferCortado = await cortarImagemProduto(bufferOriginal);
-                }
-            }
-
-            if (bufferCortado) {
-                await enviarFotoTelegram(chatOrigemId, bufferCortado, resposta);
-            } else {
-                await enviarTextoTelegram(chatOrigemId, resposta);
-            }
-        } else {
-            await enviarTextoTelegram(chatOrigemId, "❌ *[TESTE]* Não foi possível identificar o valor do produto nem extrair dados da URL.");
-        }
-
-        return { statusCode: 200, body: "OK" };
-    }
-
-    return { statusCode: 200, body: "Servidor Ativo em Modo Teste" };
+// Exporta o handler para uso no Netlify / Serverless / Render
+module.exports = {
+  bot,
+  processarListaCupons,
+  calcularMelhorCupom
 };
+
+// Se executado diretamente em ambiente Node local:
+if (require.main === module) {
+  bot.launch().then(() => console.log('🤖 Bot rodando com sucesso!'));
+}
